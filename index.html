@@ -612,17 +612,17 @@
 
 <script>
 // ================================================================
-//  CONFIGURACIÓN — pega tu URL del Web App aquí
+//  CONFIGURACIÓN — SheetDB
 // ================================================================
-const SHEETS_URL = 'https://script.google.com/macros/s/AKfycbzpXDZIZSKyVYQjuNk75Yxw4ExgCPNjDLxbzz0MO4jg1Kwol8zbUIyF0Asig4psEdw/exec';  // ← único cambio que debes hacer
+const SHEETDB_URL = 'https://sheetdb.io/api/v1/4qo1a9lemu1tl';
 
 // ================================================================
-//  CAPA DE BASE DE DATOS — Google Sheets + IndexedDB como caché
+//  BASE DE DATOS — SheetDB + IndexedDB como caché
 // ================================================================
 let db;
 const DB_NAME = 'EmpresaXYZ_Cache';
 const DB_VERSION = 2;
-let dbOnline = true; // se pone false si falla la conexión
+let dbOnline = false;
 
 // ---------- IndexedDB (caché local) ----------
 function initDB() {
@@ -636,14 +636,14 @@ function initDB() {
       });
     };
     req.onsuccess = e => { db = e.target.result; resolve(); };
-    req.onerror = () => reject(req.error);
+    req.onerror   = () => reject(req.error);
   });
 }
 function idbGetAll(store) {
   return new Promise((res, rej) => {
     const req = db.transaction(store,'readonly').objectStore(store).getAll();
     req.onsuccess = () => res(req.result);
-    req.onerror  = () => rej(req.error);
+    req.onerror   = () => rej(req.error);
   });
 }
 function idbPutMany(store, items) {
@@ -664,59 +664,41 @@ function idbGet(store, id) {
   });
 }
 
-// ---------- Google Sheets API — JSONP (evita CORS desde GitHub Pages) ----------
-function sheetsRequest(params) {
-  return new Promise((resolve, reject) => {
-    const cbName = 'cb_' + Math.random().toString(36).slice(2);
-    const timeout = setTimeout(() => {
-      delete window[cbName];
-      reject(new Error('Timeout — sin respuesta del servidor'));
-    }, 12000);
+// ---------- SheetDB helpers ----------
+const SHEET_NAMES = { sesiones: 'Sesiones', equipos: 'Equipos', servicios: 'Servicios' };
+const NUM_FIELDS  = ['id','equipoId','tarifaHora','costoServicios','costoEquipo','total','tarifa','precio'];
 
-    window[cbName] = (data) => {
-      clearTimeout(timeout);
-      delete window[cbName];
-      document.getElementById('jsonp-' + cbName)?.remove();
-      if (data && data.error) reject(new Error(data.error));
-      else resolve(data);
-    };
-
-    const { data, ...rest } = params;
-    const q = new URLSearchParams(rest);
-    q.set('callback', cbName);
-    if (data) q.set('payload', encodeURIComponent(JSON.stringify(data)));
-
-    const script = document.createElement('script');
-    script.id  = 'jsonp-' + cbName;
-    script.src = SHEETS_URL + '?' + q.toString();
-    script.onerror = () => {
-      clearTimeout(timeout);
-      delete window[cbName];
-      script.remove();
-      reject(new Error('Error cargando script JSONP'));
-    };
-    document.head.appendChild(script);
-  });
+function parseRow(store, row) {
+  const obj = { ...row };
+  NUM_FIELDS.forEach(f => { if (f in obj) obj[f] = obj[f] === '' ? 0 : Number(obj[f]); });
+  if ('servicios' in obj && typeof obj.servicios === 'string' && obj.servicios.startsWith('[')) {
+    try { obj.servicios = JSON.parse(obj.servicios); } catch(e) { obj.servicios = []; }
+  }
+  return obj;
 }
 
-// ---------- API unificada (Sheets primero, caché local como respaldo) ----------
+// ---------- API unificada ----------
 async function dbGetAll(store) {
   try {
-    const data = await sheetsRequest({ action: 'getAll', store });
-    await idbPutMany(store, data);           // actualiza caché
+    const sheet = SHEET_NAMES[store];
+    const r     = await fetch(`${SHEETDB_URL}?sheet=${sheet}`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data  = await r.json();
+    const parsed = (Array.isArray(data) ? data : []).map(row => parseRow(store, row));
+    await idbPutMany(store, parsed);
     dbOnline = true;
-    return data;
+    return parsed;
   } catch(e) {
     dbOnline = false;
-    console.warn('Sheets offline, usando caché:', e.message);
+    console.warn('SheetDB offline:', e.message);
     return idbGetAll(store);
   }
 }
 
 async function dbGet(store, id) {
   try {
-    const data = await sheetsRequest({ action: 'get', store, id });
-    return data;
+    const all = await dbGetAll(store);
+    return all.find(r => Number(r.id) === Number(id)) || null;
   } catch(e) {
     return idbGet(store, id);
   }
@@ -724,14 +706,25 @@ async function dbGet(store, id) {
 
 async function dbAdd(store, obj) {
   try {
-    const r = await sheetsRequest({ action: 'add', store, data: obj });
-    obj.id = r.id;
-    const all = await idbGetAll(store);
-    all.push(obj);
-    await idbPutMany(store, all);
-    return r.id;
+    const sheet = SHEET_NAMES[store];
+    const all   = await dbGetAll(store);
+    const newId = all.length > 0 ? Math.max(...all.map(r => Number(r.id) || 0)) + 1 : 1;
+    obj.id      = newId;
+    const toSend = { ...obj };
+    if (toSend.servicios && typeof toSend.servicios !== 'string')
+      toSend.servicios = JSON.stringify(toSend.servicios);
+    const r = await fetch(`${SHEETDB_URL}?sheet=${sheet}`, {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body   : JSON.stringify({ data: [toSend] })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const cached = await idbGetAll(store);
+    cached.push(obj);
+    await idbPutMany(store, cached);
+    return newId;
   } catch(e) {
-    // fallback a solo IndexedDB
+    console.error('dbAdd error:', e.message);
     return new Promise((res, rej) => {
       const tx  = db.transaction(store,'readwrite');
       const req = tx.objectStore(store).add(obj);
@@ -743,12 +736,22 @@ async function dbAdd(store, obj) {
 
 async function dbPut(store, obj) {
   try {
-    await sheetsRequest({ action: 'put', store, data: obj });
+    const sheet  = SHEET_NAMES[store];
+    const toSend = { ...obj };
+    if (toSend.servicios && typeof toSend.servicios !== 'string')
+      toSend.servicios = JSON.stringify(toSend.servicios);
+    const r = await fetch(`${SHEETDB_URL}/id/${obj.id}?sheet=${sheet}`, {
+      method : 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body   : JSON.stringify({ data: toSend })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const all = await idbGetAll(store);
-    const idx = all.findIndex(i => i.id === obj.id);
+    const idx = all.findIndex(i => Number(i.id) === Number(obj.id));
     if (idx >= 0) all[idx] = obj; else all.push(obj);
     await idbPutMany(store, all);
   } catch(e) {
+    console.error('dbPut error:', e.message);
     return new Promise((res, rej) => {
       const tx  = db.transaction(store,'readwrite');
       const req = tx.objectStore(store).put(obj);
@@ -760,10 +763,13 @@ async function dbPut(store, obj) {
 
 async function dbDelete(store, id) {
   try {
-    await sheetsRequest({ action: 'delete', store, id });
+    const sheet = SHEET_NAMES[store];
+    const r     = await fetch(`${SHEETDB_URL}/id/${id}?sheet=${sheet}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const all = await idbGetAll(store);
-    await idbPutMany(store, all.filter(i => i.id !== id));
+    await idbPutMany(store, all.filter(i => Number(i.id) !== Number(id)));
   } catch(e) {
+    console.error('dbDelete error:', e.message);
     return new Promise((res, rej) => {
       const tx  = db.transaction(store,'readwrite');
       const req = tx.objectStore(store).delete(id);
@@ -786,13 +792,8 @@ function updateConnectionBadge() {
     badge.onclick = () => refreshAll();
     document.body.appendChild(badge);
   }
-  if (SHEETS_URL === 'PEGA_AQUI_LA_URL_DEL_WEB_APP') {
-    badge.textContent = '⚙️ Sin configurar';
-    badge.style.background = 'rgba(255,204,0,0.2)';
-    badge.style.border = '1px solid rgba(255,204,0,0.5)';
-    badge.style.color = '#ffcc00';
-  } else if (dbOnline) {
-    badge.textContent = '🟢 Google Sheets conectado';
+  if (dbOnline) {
+    badge.textContent = '🟢 SheetDB conectado';
     badge.style.background = 'rgba(57,255,20,0.15)';
     badge.style.border = '1px solid rgba(57,255,20,0.4)';
     badge.style.color = '#39ff14';
@@ -1293,14 +1294,6 @@ async function refreshAll() {
 // ===================== INIT =====================
 async function init() {
   await initDB();
-
-  // Inicializar hojas en Google Sheets (solo la primera vez)
-  if (SHEETS_URL !== 'PEGA_AQUI_LA_URL_DEL_WEB_APP') {
-    try {
-      await sheetsRequest({ action: 'initSheets' });
-    } catch(e) { console.warn('initSheets falló:', e.message); }
-  }
-
   await insertDefaults();
   await refreshAll();
 
