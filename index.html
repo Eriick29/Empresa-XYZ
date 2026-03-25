@@ -23,7 +23,6 @@
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
-  /* SVG TECH BACKGROUND */
   body {
     background-color: var(--bg);
     color: var(--text);
@@ -36,7 +35,7 @@
     background-attachment: fixed;
   }
 
-  /* Dark overlay to keep content readable */
+ /* Dark overlay to keep content readable */
   body::before {
     content: '';
     position: fixed; inset: 0;
@@ -385,6 +384,20 @@
     <button class="tab-btn" data-tip="Ver historial completo de sesiones" onclick="showTab('registros')">📋 Registros</button>
     <button class="tab-btn" data-tip="Administrar equipos disponibles" onclick="showTab('equipos')">🖥️ Equipos</button>
     <button class="tab-btn" data-tip="Administrar servicios adicionales" onclick="showTab('servicios-tab')">🛠️ Servicios</button>
+    <button class="tab-btn" data-tip="Probar conexión con Google Sheets" onclick="showTab('diagnostico')" style="color:#ffcc00">🔧 Diagnóstico</button>
+  </div>
+
+  <!-- PANEL: DIAGNÓSTICO -->
+  <div class="panel" id="panel-diagnostico">
+    <div class="section-title">🔧 Diagnóstico de Conexión</div>
+    <div style="background:rgba(13,13,34,0.9);border:1px solid rgba(0,212,255,0.2);border-radius:14px;padding:1.5rem;margin-bottom:1rem;">
+      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:1rem;">Presiona el botón para probar cada paso de la conexión con Google Sheets.</p>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="diagFull()">▶️ Ejecutar diagnóstico completo</button>
+        <button class="btn btn-ghost" onclick="document.getElementById('diag-log').innerHTML=''">🗑️ Limpiar</button>
+      </div>
+    </div>
+    <div id="diag-log" style="font-family:monospace;font-size:0.82rem;line-height:1.8;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:12px;padding:1.2rem;min-height:200px;"></div>
   </div>
 
   <!-- PANEL: DASHBOARD -->
@@ -597,10 +610,14 @@
 <div class="toast-container" id="toast-container"></div>
 
 <script>
+// ================================================================
+//  CONFIGURACIÓN — pega tu URL del Web App aquí
+// ================================================================
+const SHEETS_URL = 'https://script.google.com/macros/s/AKfycbzpXDZIZSKyVYQjuNk75Yxw4ExgCPNjDLxbzz0MO4jg1Kwol8zbUIyF0Asig4psEdw/exec';  // ← único cambio que debes hacer
 
-const SHEETS_URL = 'https://script.google.com/macros/s/AKfycbyEPhUP3OB7fglvo_IBykYVlU_nUc4__T6-iAqh2ITJBEeEH3qZb7gYpewNLaXYK5VE/exec';  
-
-
+// ================================================================
+//  CAPA DE BASE DE DATOS — Google Sheets + IndexedDB como caché
+// ================================================================
 let db;
 const DB_NAME = 'EmpresaXYZ_Cache';
 const DB_VERSION = 2;
@@ -646,25 +663,27 @@ function idbGet(store, id) {
   });
 }
 
-// ---------- Google Sheets API ----------
+// ---------- Google Sheets API (solo GET para evitar CORS) ----------
 async function sheetsRequest(params) {
   if (SHEETS_URL === 'PEGA_AQUI_LA_URL_DEL_WEB_APP') {
     throw new Error('Configura SHEETS_URL primero');
   }
-  const isGet = params.action === 'getAll' || params.action === 'get' || params.action === 'initSheets';
-  let url = SHEETS_URL;
-  if (isGet) {
-    const q = new URLSearchParams(params);
-    url += '?' + q.toString();
+
+  // Separar datos del payload del resto de params
+  const { data, ...rest } = params;
+  const q = new URLSearchParams(rest);
+
+  // Si hay datos (add/put), van codificados en "payload"
+  if (data) {
+    q.set('payload', encodeURIComponent(JSON.stringify(data)));
   }
-  const opts = isGet ? { method: 'GET' } : {
-    method : 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body   : JSON.stringify(params)
-  };
-  const r = await fetch(url, opts);
+
+  const url = SHEETS_URL + '?' + q.toString();
+  const r   = await fetch(url, { method: 'GET' });
   if (!r.ok) throw new Error('HTTP ' + r.status);
-  return r.json();
+  const json = await r.json();
+  if (json.error) throw new Error(json.error);
+  return json;
 }
 
 // ---------- API unificada (Sheets primero, caché local como respaldo) ----------
@@ -693,24 +712,13 @@ async function dbGet(store, id) {
 async function dbAdd(store, obj) {
   try {
     const r = await sheetsRequest({ action: 'add', store, data: obj });
-    if (r.error) throw new Error(r.error);
     obj.id = r.id;
-    // actualiza caché
     const all = await idbGetAll(store);
     all.push(obj);
     await idbPutMany(store, all);
     return r.id;
   } catch(e) {
-    if (SHEETS_URL === 'PEGA_AQUI_LA_URL_DEL_WEB_APP') {
-      // modo demo sin configurar: solo IndexedDB
-      return new Promise((res, rej) => {
-        const tx  = db.transaction(store,'readwrite');
-        const req = tx.objectStore(store).add(obj);
-        req.onsuccess = () => res(req.result);
-        req.onerror   = () => rej(req.error);
-      });
-    }
-    toast('⚠️ Sin conexión — guardado localmente', 'error');
+    // fallback a solo IndexedDB
     return new Promise((res, rej) => {
       const tx  = db.transaction(store,'readwrite');
       const req = tx.objectStore(store).add(obj);
@@ -722,14 +730,11 @@ async function dbAdd(store, obj) {
 
 async function dbPut(store, obj) {
   try {
-    const r = await sheetsRequest({ action: 'put', store, data: obj });
-    if (r.error) throw new Error(r.error);
-    // actualiza caché
+    await sheetsRequest({ action: 'put', store, data: obj });
     const all = await idbGetAll(store);
     const idx = all.findIndex(i => i.id === obj.id);
     if (idx >= 0) all[idx] = obj; else all.push(obj);
     await idbPutMany(store, all);
-    return r;
   } catch(e) {
     return new Promise((res, rej) => {
       const tx  = db.transaction(store,'readwrite');
@@ -742,11 +747,9 @@ async function dbPut(store, obj) {
 
 async function dbDelete(store, id) {
   try {
-    const r = await sheetsRequest({ action: 'delete', store, id });
-    if (r.error) throw new Error(r.error);
+    await sheetsRequest({ action: 'delete', store, id });
     const all = await idbGetAll(store);
     await idbPutMany(store, all.filter(i => i.id !== id));
-    return r;
   } catch(e) {
     return new Promise((res, rej) => {
       const tx  = db.transaction(store,'readwrite');
@@ -1301,6 +1304,98 @@ async function init() {
   setInterval(async () => {
     await refreshAll();
   }, 30000);
+}
+
+// ===================== DIAGNÓSTICO =====================
+function diagLog(msg, color = '#f0f0ff') {
+  const el = document.getElementById('diag-log');
+  if (!el) return;
+  const time = new Date().toLocaleTimeString('es-PA');
+  el.innerHTML += `<span style="color:#7878aa">[${time}]</span> <span style="color:${color}">${msg}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function diagFull() {
+  const el = document.getElementById('diag-log');
+  el.innerHTML = '';
+  diagLog('🔍 Iniciando diagnóstico...', '#00d4ff');
+  diagLog('─────────────────────────────────────');
+
+  // 1. Verificar URL configurada
+  diagLog('1️⃣  Verificando URL configurada...');
+  if (SHEETS_URL.includes('PEGA_AQUI')) {
+    diagLog('   ❌ SHEETS_URL no está configurada. Edita el HTML y pega tu URL.', '#ff2d78');
+    return;
+  }
+  diagLog(`   ✅ URL encontrada: ${SHEETS_URL.slice(0,60)}...`, '#39ff14');
+
+  // 2. Probar fetch básico (sin acción)
+  diagLog('2️⃣  Probando conexión básica con fetch...');
+  try {
+    const r = await fetch(SHEETS_URL + '?action=initSheets', { method: 'GET' });
+    diagLog(`   📡 HTTP Status: ${r.status} ${r.statusText}`, r.ok ? '#39ff14' : '#ff2d78');
+    if (!r.ok) {
+      diagLog('   ❌ El servidor respondió con error. Verifica que la implementación esté publicada.', '#ff2d78');
+      return;
+    }
+    const text = await r.text();
+    diagLog(`   📄 Respuesta raw: ${text.slice(0, 120)}`, '#ffcc00');
+    try {
+      const json = JSON.parse(text);
+      if (json.error) {
+        diagLog(`   ❌ Error del script: ${json.error}`, '#ff2d78');
+        diagLog('   💡 Verifica que SPREADSHEET_ID sea correcto en el Apps Script.', '#ffcc00');
+        return;
+      }
+      diagLog(`   ✅ initSheets OK: ${JSON.stringify(json)}`, '#39ff14');
+    } catch(e) {
+      diagLog('   ❌ La respuesta no es JSON válido. Posiblemente pide login de Google.', '#ff2d78');
+      diagLog('   💡 Solución: ve a la URL directamente en el navegador y acepta permisos.', '#ffcc00');
+      diagLog(`   🔗 URL a abrir: ${SHEETS_URL}?action=initSheets`, '#00d4ff');
+      return;
+    }
+  } catch(e) {
+    diagLog(`   ❌ fetch falló: ${e.message}`, '#ff2d78');
+    if (e.message.includes('CORS') || e.message.includes('cors')) {
+      diagLog('   💡 Error CORS: asegúrate de usar la URL de "exec", no de "dev".', '#ffcc00');
+    } else if (e.message.includes('Failed to fetch') || e.message.includes('NetworkError')) {
+      diagLog('   💡 Sin conexión a internet o la URL es incorrecta.', '#ffcc00');
+    }
+    return;
+  }
+
+  // 3. Probar getAll equipos
+  diagLog('3️⃣  Probando lectura de Equipos...');
+  try {
+    const equipos = await sheetsRequest({ action: 'getAll', store: 'equipos' });
+    diagLog(`   ✅ Equipos leídos: ${equipos.length} registros`, '#39ff14');
+  } catch(e) {
+    diagLog(`   ❌ Error leyendo equipos: ${e.message}`, '#ff2d78');
+  }
+
+  // 4. Probar getAll sesiones
+  diagLog('4️⃣  Probando lectura de Sesiones...');
+  try {
+    const sesiones = await sheetsRequest({ action: 'getAll', store: 'sesiones' });
+    diagLog(`   ✅ Sesiones leídas: ${sesiones.length} registros`, '#39ff14');
+  } catch(e) {
+    diagLog(`   ❌ Error leyendo sesiones: ${e.message}`, '#ff2d78');
+  }
+
+  // 5. Probar escritura (add + delete de prueba)
+  diagLog('5️⃣  Probando escritura (registro de prueba)...');
+  try {
+    const r = await sheetsRequest({ action: 'add', store: 'servicios', data: { nombre: '__TEST__', icono: '🧪', precio: 0, unidad: 'test' }});
+    diagLog(`   ✅ Escritura OK — id asignado: ${r.id}`, '#39ff14');
+    // borrar el registro de prueba
+    await sheetsRequest({ action: 'delete', store: 'servicios', id: r.id });
+    diagLog('   ✅ Eliminación OK — registro de prueba borrado', '#39ff14');
+  } catch(e) {
+    diagLog(`   ❌ Error en escritura: ${e.message}`, '#ff2d78');
+  }
+
+  diagLog('─────────────────────────────────────');
+  diagLog('✅ Diagnóstico completo. Revisa los resultados arriba.', '#00d4ff');
 }
 
 init();
