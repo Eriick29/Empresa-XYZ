@@ -23,6 +23,7 @@
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
+  /* SVG TECH BACKGROUND */
   body {
     background-color: var(--bg);
     color: var(--text);
@@ -35,7 +36,7 @@
     background-attachment: fixed;
   }
 
- /* Dark overlay to keep content readable */
+  /* Dark overlay to keep content readable */
   body::before {
     content: '';
     position: fixed; inset: 0;
@@ -663,27 +664,39 @@ function idbGet(store, id) {
   });
 }
 
-// ---------- Google Sheets API (solo GET para evitar CORS) ----------
-async function sheetsRequest(params) {
-  if (SHEETS_URL === 'PEGA_AQUI_LA_URL_DEL_WEB_APP') {
-    throw new Error('Configura SHEETS_URL primero');
-  }
+// ---------- Google Sheets API — JSONP (evita CORS desde GitHub Pages) ----------
+function sheetsRequest(params) {
+  return new Promise((resolve, reject) => {
+    const cbName = 'cb_' + Math.random().toString(36).slice(2);
+    const timeout = setTimeout(() => {
+      delete window[cbName];
+      reject(new Error('Timeout — sin respuesta del servidor'));
+    }, 12000);
 
-  // Separar datos del payload del resto de params
-  const { data, ...rest } = params;
-  const q = new URLSearchParams(rest);
+    window[cbName] = (data) => {
+      clearTimeout(timeout);
+      delete window[cbName];
+      document.getElementById('jsonp-' + cbName)?.remove();
+      if (data && data.error) reject(new Error(data.error));
+      else resolve(data);
+    };
 
-  // Si hay datos (add/put), van codificados en "payload"
-  if (data) {
-    q.set('payload', encodeURIComponent(JSON.stringify(data)));
-  }
+    const { data, ...rest } = params;
+    const q = new URLSearchParams(rest);
+    q.set('callback', cbName);
+    if (data) q.set('payload', encodeURIComponent(JSON.stringify(data)));
 
-  const url = SHEETS_URL + '?' + q.toString();
-  const r   = await fetch(url, { method: 'GET' });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  const json = await r.json();
-  if (json.error) throw new Error(json.error);
-  return json;
+    const script = document.createElement('script');
+    script.id  = 'jsonp-' + cbName;
+    script.src = SHEETS_URL + '?' + q.toString();
+    script.onerror = () => {
+      clearTimeout(timeout);
+      delete window[cbName];
+      script.remove();
+      reject(new Error('Error cargando script JSONP'));
+    };
+    document.head.appendChild(script);
+  });
 }
 
 // ---------- API unificada (Sheets primero, caché local como respaldo) ----------
